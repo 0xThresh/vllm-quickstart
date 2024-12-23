@@ -2,6 +2,13 @@ import pulumi
 import pulumi_aws as aws
 import json
 
+# Get the Pulumi config to access DataDog API key and HF token (if applicable)
+config = pulumi.Config()
+datadog_api_key = config.require("DataDogAPIKey")
+datadog_site = config.require("DataDogSite")
+hf_token = config.require("HFToken")
+model = config.require("Model")
+
 # Create a VPC
 vpc = aws.ec2.Vpc("vllm-vpc",
     cidr_block="10.7.0.0/16",
@@ -89,17 +96,49 @@ instance_profile = aws.iam.InstanceProfile("ssm-instance-profile",
     }
 )
 
-# Read the userdata script
-with open("userdata.sh", "r") as f:
-    userdata = f.read()
-
 # Create EC2 instance in the public subnet
 ec2_instance = aws.ec2.Instance("vllm-instance",
     instance_type="g5.xlarge",
     ami="ami-081f526a977142913",
     subnet_id=public_subnet.id,
     iam_instance_profile=instance_profile.name,
-    user_data=userdata,
+    user_data=f"""#!/bin/bash
+# Get secrets, sourced from Pulumi
+export DD_API_KEY={datadog_api_key}
+export DD_SITE={datadog_site}
+export HF_TOKEN={hf_token}
+
+# Install Conda
+mkdir -p /usr/lib/miniconda3
+wget https://repo.anaconda.com/miniconda/Miniconda3-py310_24.11.1-0-Linux-x86_64.sh -O /usr/lib/miniconda3/miniconda.sh
+bash /usr/lib/miniconda3/miniconda.sh -b -u -p /usr/lib/miniconda3/
+rm /usr/lib/miniconda3/miniconda.sh
+
+# Set up vLLM
+/usr/lib/miniconda3/bin/conda create -n vllm python=3.10 -y
+/usr/lib/miniconda3/bin/conda activate vllm
+pip install vllm
+# Set the HF_TOKEN value if it's passed into userdata to allow vLLM to pull gated models
+if [ ! -z "$HF_TOKEN" ]; then
+    export HF_TOKEN=$HF_TOKEN
+fi
+vllm serve {model} &
+
+# Set up DataDog agent 
+DD_API_KEY=$DD_API_KEY \
+DD_SITE=$DD_SITE \
+bash -c "$(curl -L https://install.datadoghq.com/scripts/install_script_agent7.sh)"
+
+# Enable vLLM DataDog integration
+cat << EOF > /etc/datadog-agent/conf.d/vllm.d/conf.yaml
+init_config:
+    service: vllm
+
+instances:
+  - openmetrics_endpoint: http://localhost:8000/metrics
+    enable_health_service_check: true
+EOF
+""",
     root_block_device={
         "volume_size": 120,
         "volume_type": "gp3",
